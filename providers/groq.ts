@@ -1,5 +1,6 @@
+
 /* ==================================================
-   BLAZE-X V1.0
+   BLAZE-X V1.0.2
    GROQ X — High-Speed Intelligence Engine
    Developed by Yuva
 ================================================== */
@@ -38,6 +39,8 @@ const MODELS = {
 
 const REQUEST_TIMEOUT = 30000;
 
+const MAX_STREAM_BUFFER = 1000000;
+
 /* GROQ PROVIDER */
 
 class GroqProvider implements AIProvider {
@@ -48,7 +51,7 @@ class GroqProvider implements AIProvider {
   readonly capabilities: ProviderCapabilities = {
     text: true,
     streaming: true,
-    reasoning: false,
+    reasoning: true,
     vision: false,
     files: false,
     tools: false,
@@ -57,18 +60,22 @@ class GroqProvider implements AIProvider {
   /* CHECK CONFIGURATION */
 
   isConfigured(): boolean {
-    return Boolean(env.GROQ_API_KEY);
+    return Boolean(env.GROQ_API_KEY?.trim());
   }
 
   /* MODEL SELECTION */
 
   private selectModel(request: AIRequest): string {
-    return request.model || MODELS[request.mode];
+    return (
+      request.model ||
+      MODELS[request.mode]
+    ).trim();
   }
 
   /* STANDARD ERROR HANDLING */
 
   private handleError(status: number): never {
+
     if (status === 401 || status === 403) {
       throw new AIProviderError(
         this.id,
@@ -107,6 +114,16 @@ class GroqProvider implements AIProvider {
       );
     }
 
+    if (status === 408 || status === 504) {
+      throw new AIProviderError(
+        this.id,
+        "TIMEOUT",
+        "Groq request timed out.",
+        status,
+        true
+      );
+    }
+
     throw new AIProviderError(
       this.id,
       "UNKNOWN",
@@ -121,7 +138,7 @@ class GroqProvider implements AIProvider {
   private async request(
     request: AIRequest,
     streaming: boolean
-  ): Promise<Response> {
+  ) {
     if (!this.isConfigured()) {
       throw new AIProviderError(
         this.id,
@@ -129,6 +146,10 @@ class GroqProvider implements AIProvider {
         "Groq API key is missing."
       );
     }
+
+    const startedAt = Date.now();
+
+    const model = this.selectModel(request);
 
     const timeoutSignal =
       AbortSignal.timeout(REQUEST_TIMEOUT);
@@ -140,42 +161,86 @@ class GroqProvider implements AIProvider {
         ])
       : timeoutSignal;
 
+    const isGptOss =
+      model.startsWith("openai/gpt-oss-");
+
+    const payload = {
+      model,
+
+      messages: request.messages,
+
+      temperature:
+        request.temperature ?? 0.7,
+
+      max_completion_tokens:
+        request.maxTokens ?? 2048,
+
+      stream: streaming,
+
+      ...(isGptOss
+        ? {
+            reasoning_effort:
+              request.mode === "deep"
+                ? "medium"
+                : "low",
+          }
+        : {}),
+    };
+
+    console.info("[BLAZE-X] GROQ REQUEST", {
+      model,
+      mode: request.mode,
+      streaming,
+    });
+
     try {
       const response = await fetch(API_URL, {
         method: "POST",
 
         headers: {
           Authorization:
-            `Bearer ${env.GROQ_API_KEY}`,
+            `Bearer ${env.GROQ_API_KEY.trim()}`,
 
           "Content-Type": "application/json",
+
+          Accept: streaming
+            ? "text/event-stream"
+            : "application/json",
         },
 
-        body: JSON.stringify({
-          model: this.selectModel(request),
-
-          messages: request.messages,
-
-          temperature: request.temperature ?? 0.7,
-
-          max_completion_tokens:
-            request.maxTokens ?? 2048,
-
-          stream: streaming,
-        }),
+        body: JSON.stringify(payload),
 
         signal,
 
         cache: "no-store",
       });
 
+      console.info("[BLAZE-X] GROQ HTTP", {
+        model,
+        status: response.status,
+        elapsedMs: Date.now() - startedAt,
+      });
+
       if (!response.ok) {
-        await response.body?.cancel();
+
+        if (response.body) {
+          void response.body
+            .cancel()
+            .catch(() => {});
+        }
+
         this.handleError(response.status);
       }
 
-      return response;
+      return {
+        response,
+        model,
+        startedAt,
+        timeoutSignal,
+      };
+
     } catch (error) {
+
       if (error instanceof AIProviderError) {
         throw error;
       }
@@ -198,6 +263,11 @@ class GroqProvider implements AIProvider {
         );
       }
 
+      console.warn("[BLAZE-X] GROQ NETWORK ERROR", {
+        model,
+        elapsedMs: Date.now() - startedAt,
+      });
+
       throw new AIProviderError(
         this.id,
         "NETWORK_ERROR",
@@ -213,51 +283,88 @@ class GroqProvider implements AIProvider {
   async generate(
     request: AIRequest
   ): Promise<AIResponse> {
-    const startedAt = Date.now();
 
-    const response = await this.request(
-      request,
-      false
-    );
+    const {
+      response,
+      model,
+      startedAt,
+      timeoutSignal,
+    } = await this.request(request, false);
 
-    const data = await response.json();
+    try {
+      const data = await response.json();
 
-    const content =
-      data.choices?.[0]?.message?.content;
+      const content =
+        data.choices?.[0]?.message?.content;
 
-    if (typeof content !== "string") {
+      if (
+        typeof content !== "string" ||
+        !content.trim()
+      ) {
+        throw new AIProviderError(
+          this.id,
+          "UNKNOWN",
+          "Groq returned an empty response.",
+          undefined,
+          true
+        );
+      }
+
+      return {
+        provider: this.id,
+
+        model: data.model || model,
+
+        content,
+
+        latencyMs: Date.now() - startedAt,
+
+        usage: data.usage
+          ? {
+              inputTokens:
+                data.usage.prompt_tokens || 0,
+
+              outputTokens:
+                data.usage.completion_tokens || 0,
+
+              totalTokens:
+                data.usage.total_tokens || 0,
+            }
+          : undefined,
+      };
+
+    } catch (error) {
+
+      if (error instanceof AIProviderError) {
+        throw error;
+      }
+
+      if (request.signal?.aborted) {
+        throw new AIProviderError(
+          this.id,
+          "ABORTED",
+          "Groq request cancelled."
+        );
+      }
+
+      if (timeoutSignal.aborted) {
+        throw new AIProviderError(
+          this.id,
+          "TIMEOUT",
+          "Groq response timed out.",
+          undefined,
+          true
+        );
+      }
+
       throw new AIProviderError(
         this.id,
-        "UNKNOWN",
-        "Groq returned an invalid response.",
+        "NETWORK_ERROR",
+        "Unable to read Groq response.",
         undefined,
         true
       );
     }
-
-    return {
-      provider: this.id,
-
-      model:
-        data.model || this.selectModel(request),
-
-      content,
-
-      latencyMs: Date.now() - startedAt,
-
-      usage: data.usage
-        ? {
-            inputTokens:
-              data.usage.prompt_tokens || 0,
-
-            outputTokens:
-              data.usage.completion_tokens || 0,
-
-            totalTokens:
-              data.usage.total_tokens || 0,
-          }
-        : undefined,
-    };
   }
 
   /* LIVE STREAMING RESPONSE */
@@ -265,10 +372,13 @@ class GroqProvider implements AIProvider {
   async stream(
     request: AIRequest
   ): Promise<AIStreamResponse> {
-    const response = await this.request(
-      request,
-      true
-    );
+
+    const {
+      response,
+      model,
+      startedAt,
+      timeoutSignal,
+    } = await this.request(request, true);
 
     if (!response.body) {
       throw new AIProviderError(
@@ -286,131 +396,415 @@ class GroqProvider implements AIProvider {
 
     const encoder = new TextEncoder();
 
+    const providerId = this.id;
+
     let buffer = "";
 
     let completed = false;
 
-    const providerId = this.id;
+    let receivedContent = false;
 
-    const stream = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        if (completed) return;
+    let finishReason: string | null = null;
 
-        function processLine(line: string): boolean {
-          const clean = line.trim();
+    let cleanedUp = false;
 
-          if (!clean.startsWith("data:")) {
-            return false;
-          }
+    let eventData: string[] = [];
 
-          const payload = clean.slice(5).trim();
+    /* NON-BLOCKING STREAM CLEANUP */
 
-          if (payload === "[DONE]") {
-            completed = true;
-            return true;
-          }
+    function cleanup(
+      cancelReader: boolean,
+      reason?: unknown
+    ) {
+      if (cleanedUp) return;
 
-          if (!payload) return false;
+      cleanedUp = true;
 
-          const data = JSON.parse(payload);
+      if (cancelReader) {
+        void reader.cancel(reason)
+          .catch(() => {});
+      }
 
-          if (data.error) {
-            throw new AIProviderError(
-              providerId,
-              "UNKNOWN",
-              "Groq streaming request failed."
-            );
-          }
+      try {
+        reader.releaseLock();
+      } catch {
+        // Reader already released.
+      }
+    }
 
-          const content =
-            data.choices?.[0]?.delta?.content;
+    /* SSE EVENT PROCESSOR */
 
-          if (
-            typeof content === "string" &&
-            content.length > 0
-          ) {
-            controller.enqueue(
-              encoder.encode(content)
-            );
-          }
+    function processEvent(
+      payload: string,
+      controller:
+        ReadableStreamDefaultController<Uint8Array>
+    ): boolean {
 
+      const clean = payload.trim();
+
+      if (!clean) return false;
+
+      if (clean === "[DONE]") {
+        completed = true;
+        return true;
+      }
+
+      let data;
+
+      try {
+        data = JSON.parse(clean);
+      } catch {
+        throw new AIProviderError(
+          providerId,
+          "UNKNOWN",
+          "Groq returned invalid streaming data.",
+          undefined,
+          true
+        );
+      }
+
+      if (data.error) {
+        console.warn(
+          "[BLAZE-X] GROQ STREAM ERROR",
+          { model }
+        );
+
+        throw new AIProviderError(
+          providerId,
+          "UNKNOWN",
+          "Groq streaming request failed.",
+          undefined,
+          true
+        );
+      }
+
+      const choice = data.choices?.[0];
+
+      if (choice?.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
+
+      /*
+        GPT-OSS may return reasoning before
+        final answer content.
+
+        Only final answer content is sent
+        to the BLAZE-X chat interface.
+      */
+
+      const content = choice?.delta?.content;
+
+      if (
+        typeof content === "string" &&
+        content.length > 0
+      ) {
+
+        if (!receivedContent) {
+          receivedContent = true;
+
+          console.info(
+            "[BLAZE-X] GROQ FIRST TOKEN",
+            {
+              model,
+              elapsedMs:
+                Date.now() - startedAt,
+            }
+          );
+        }
+
+        controller.enqueue(
+          encoder.encode(content)
+        );
+      }
+
+      return false;
+    }
+
+    /* SSE LINE PROCESSOR */
+
+    function processLine(
+      line: string,
+      controller:
+        ReadableStreamDefaultController<Uint8Array>
+    ): boolean {
+
+      const clean = line.replace(/\r$/, "");
+
+      if (clean === "") {
+
+        if (!eventData.length) {
           return false;
         }
 
+        const payload = eventData.join("\n");
+
+        eventData = [];
+
+        return processEvent(
+          payload,
+          controller
+        );
+      }
+
+      if (clean.startsWith("data:")) {
+
+        eventData.push(
+          clean.slice(5).replace(/^ /, "")
+        );
+
+        const eventSize = eventData.reduce(
+          (total, part) => total + part.length,
+          0
+        );
+
+        if (eventSize > MAX_STREAM_BUFFER) {
+          throw new AIProviderError(
+            providerId,
+            "UNKNOWN",
+            "Groq streaming event exceeded limit.",
+            undefined,
+            true
+          );
+        }
+      }
+
+      return false;
+    }
+
+    /* STREAM COMPLETION */
+
+    function finish(
+      controller:
+        ReadableStreamDefaultController<Uint8Array>,
+      cancelReader: boolean
+    ) {
+
+      completed = true;
+
+      if (!receivedContent) {
+        throw new AIProviderError(
+          providerId,
+          "UNKNOWN",
+          "Groq completed without answer content.",
+          undefined,
+          true
+        );
+      }
+
+      console.info("[BLAZE-X] GROQ COMPLETE", {
+        model,
+        finishReason,
+        elapsedMs: Date.now() - startedAt,
+      });
+
+      controller.close();
+
+      cleanup(cancelReader);
+    }
+
+    /* CONTINUOUS STREAM READER */
+
+    const stream = new ReadableStream<Uint8Array>({
+
+      async pull(controller) {
+
+        if (completed) return;
+
         try {
-          const { done, value } =
-            await reader.read();
 
-          if (done) {
-            buffer += decoder.decode();
+          /*
+            Continue reading when chunks contain
+            reasoning, metadata or partial SSE.
 
-            if (buffer.trim()) {
-              processLine(buffer);
-            }
+            Return only after answer content is
+            available or the stream has ended.
+          */
 
-            if (!completed) {
+          while (!completed) {
+
+            if (request.signal?.aborted) {
               throw new AIProviderError(
                 providerId,
-                "NETWORK_ERROR",
-                "Groq stream ended unexpectedly."
+                "ABORTED",
+                "Groq request cancelled."
               );
             }
 
-            controller.close();
-            reader.releaseLock();
-            return;
-          }
+            if (timeoutSignal.aborted) {
+              throw new AIProviderError(
+                providerId,
+                "TIMEOUT",
+                "Groq stream timed out.",
+                undefined,
+                true
+              );
+            }
 
-          buffer += decoder.decode(value, {
-            stream: true,
-          });
+            const { done, value } =
+              await reader.read();
 
-          const lines = buffer.split("\n");
+            if (completed) return;
 
-          buffer = lines.pop() || "";
+            if (done) {
 
-          for (const line of lines) {
-            if (processLine(line)) {
-              controller.close();
-              await reader.cancel();
-              reader.releaseLock();
+              buffer += decoder.decode();
+
+              if (buffer.length > 0) {
+                processLine(
+                  buffer,
+                  controller
+                );
+
+                buffer = "";
+              }
+
+              if (eventData.length > 0) {
+
+                const payload =
+                  eventData.join("\n");
+
+                eventData = [];
+
+                processEvent(
+                  payload,
+                  controller
+                );
+              }
+
+              if (!completed && !finishReason) {
+                throw new AIProviderError(
+                  providerId,
+                  "NETWORK_ERROR",
+                  "Groq stream ended unexpectedly.",
+                  undefined,
+                  true
+                );
+              }
+
+              finish(controller, false);
+
+              return;
+            }
+
+            buffer += decoder.decode(value, {
+              stream: true,
+            });
+
+            if (buffer.length > MAX_STREAM_BUFFER) {
+              throw new AIProviderError(
+                providerId,
+                "UNKNOWN",
+                "Groq stream buffer exceeded limit.",
+                undefined,
+                true
+              );
+            }
+
+            const lines = buffer.split("\n");
+
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+
+              const ended = processLine(
+                line,
+                controller
+              );
+
+              if (ended) {
+
+                finish(controller, true);
+
+                return;
+              }
+            }
+
+            /*
+              Respect downstream backpressure
+              after actual content is queued.
+            */
+
+            if (
+              controller.desiredSize !== null &&
+              controller.desiredSize <= 0
+            ) {
               return;
             }
           }
+
         } catch (error) {
+
           completed = true;
 
-          controller.error(error);
+          let safeError: unknown = error;
 
-          try {
-            await reader.cancel();
-          } catch {
-            // Stream already closed.
+          if (!(error instanceof AIProviderError)) {
+
+            if (request.signal?.aborted) {
+
+              safeError = new AIProviderError(
+                providerId,
+                "ABORTED",
+                "Groq request cancelled."
+              );
+
+            } else if (timeoutSignal.aborted) {
+
+              safeError = new AIProviderError(
+                providerId,
+                "TIMEOUT",
+                "Groq stream timed out.",
+                undefined,
+                true
+              );
+
+            } else {
+
+              safeError = new AIProviderError(
+                providerId,
+                "NETWORK_ERROR",
+                "Groq streaming connection failed.",
+                undefined,
+                true
+              );
+            }
           }
 
+          console.warn(
+            "[BLAZE-X] GROQ STREAM FAILED",
+            {
+              model,
+
+              code:
+                safeError instanceof AIProviderError
+                  ? safeError.code
+                  : "UNKNOWN",
+
+              elapsedMs:
+                Date.now() - startedAt,
+            }
+          );
+
           try {
-            reader.releaseLock();
-          } catch {
-            // Reader already released.
+            controller.error(safeError);
+          } finally {
+            cleanup(true);
           }
         }
       },
 
-      async cancel(reason) {
+      cancel(reason) {
+
         completed = true;
 
-        try {
-          await reader.cancel(reason);
-        } finally {
-          reader.releaseLock();
-        }
+        cleanup(true, reason);
       },
     });
 
     return {
       provider: this.id,
 
-      model: this.selectModel(request),
+      model,
 
       stream,
     };
@@ -421,4 +815,4 @@ class GroqProvider implements AIProvider {
 
 export const groqProvider = new GroqProvider();
 
-/* END OF GROQ X ENGINE */
+/* END OF GROQ X ENGINE V1.0.2 */
