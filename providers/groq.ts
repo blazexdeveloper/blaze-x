@@ -25,15 +25,15 @@ const API_URL =
 const MODELS = {
   instant:
     process.env.GROQ_INSTANT_MODEL ||
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
 
   auto:
     process.env.GROQ_AUTO_MODEL ||
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
 
   deep:
     process.env.GROQ_DEEP_MODEL ||
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
 };
 
 const REQUEST_TIMEOUT = 30000;
