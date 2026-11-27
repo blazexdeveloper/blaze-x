@@ -1,5 +1,6 @@
+
 /* ==================================================
-   BLAZE-X V1.0
+   BLAZE-X V1.0.2
    Secure CORE BRAIN Chat API
    Developed by Yuva
 ================================================== */
@@ -15,6 +16,8 @@ import { env } from "@/lib/env";
 import { checkRateLimit } from "@/lib/redis";
 
 import { coreBrain } from "@/engines/core/router";
+
+import { AIProviderError } from "@/providers/types";
 
 /* RUNTIME CONFIGURATION */
 
@@ -133,6 +136,10 @@ async function readBody(
 
   try {
     while (true) {
+      if (request.signal.aborted) {
+        throw new Error("REQUEST_ABORTED");
+      }
+
       const { done, value } =
         await reader.read();
 
@@ -141,7 +148,7 @@ async function readBody(
       totalBytes += value.byteLength;
 
       if (totalBytes > MAX_BODY_BYTES) {
-        await reader.cancel();
+        void reader.cancel().catch(() => {});
 
         throw new Error("BODY_TOO_LARGE");
       }
@@ -154,6 +161,7 @@ async function readBody(
     body += decoder.decode();
 
     return body;
+
   } finally {
     reader.releaseLock();
   }
@@ -164,8 +172,27 @@ async function readBody(
 export async function POST(
   request: NextRequest
 ) {
+  const startedAt = Date.now();
+
+  const requestId = crypto.randomUUID();
+
+  let stage = "INITIALIZATION";
+
+  function logStage(nextStage: string) {
+    stage = nextStage;
+
+    console.info("[BLAZE-X] CHAT STAGE", {
+      requestId,
+      stage,
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
   try {
+
     /* STEP 1 — CONFIGURATION CHECK */
+
+    logStage("CONFIGURATION");
 
     if (
       !env.SUPABASE_URL ||
@@ -179,6 +206,8 @@ export async function POST(
 
     /* STEP 2 — AUTHENTICATE USER */
 
+    logStage("AUTHENTICATION");
+
     const userId = await authenticate(request);
 
     if (!userId) {
@@ -189,6 +218,8 @@ export async function POST(
     }
 
     /* STEP 3 — CONTENT TYPE CHECK */
+
+    logStage("CONTENT_TYPE");
 
     const contentType =
       request.headers.get("content-type") || "";
@@ -205,9 +236,21 @@ export async function POST(
 
     /* STEP 4 — BODY SIZE CHECK */
 
+    logStage("BODY_SIZE");
+
     const contentLength = Number(
       request.headers.get("content-length") || 0
     );
+
+    if (
+      !Number.isSafeInteger(contentLength) ||
+      contentLength < 0
+    ) {
+      return errorResponse(
+        "Invalid content length.",
+        400
+      );
+    }
 
     if (contentLength > MAX_BODY_BYTES) {
       return errorResponse(
@@ -218,13 +261,24 @@ export async function POST(
 
     /* STEP 5 — PARSE REQUEST */
 
+    logStage("BODY_PARSING");
+
     let body: unknown;
 
     try {
       const rawBody = await readBody(request);
 
       body = JSON.parse(rawBody);
+
     } catch (error) {
+
+      if (request.signal.aborted) {
+        return errorResponse(
+          "Request cancelled.",
+          499
+        );
+      }
+
       if (
         error instanceof Error &&
         error.message === "BODY_TOO_LARGE"
@@ -242,6 +296,8 @@ export async function POST(
     }
 
     /* STEP 6 — VALIDATE REQUEST */
+
+    logStage("VALIDATION");
 
     const validated =
       ChatRequestSchema.safeParse(body);
@@ -267,7 +323,9 @@ export async function POST(
 
     /* STEP 7 — CONTEXT MANAGEMENT */
 
-    const selected = [];
+    logStage("CONTEXT_MANAGEMENT");
+
+    const selected: typeof messages = [];
 
     let totalLength = 0;
 
@@ -292,10 +350,20 @@ export async function POST(
 
     /* STEP 8 — RATE LIMIT PROTECTION */
 
+    logStage("REDIS_RATE_LIMIT");
+
     const rateLimit =
       await checkRateLimit(userId);
 
+    console.info("[BLAZE-X] REDIS RESULT", {
+      requestId,
+      allowed: rateLimit.allowed,
+      reason: rateLimit.reason || "OK",
+      elapsedMs: Date.now() - startedAt,
+    });
+
     if (!rateLimit.allowed) {
+
       const retryAfter = Math.max(
         1,
         Math.ceil(
@@ -332,7 +400,25 @@ export async function POST(
       );
     }
 
+    /* CHECK CANCELLATION */
+
+    if (request.signal.aborted) {
+      return errorResponse(
+        "Request cancelled.",
+        499
+      );
+    }
+
     /* STEP 9 — CORE BRAIN */
+
+    logStage("CORE_BRAIN");
+
+    console.info("[BLAZE-X] AI REQUEST", {
+      requestId,
+      mode,
+      messageCount: selected.length,
+      contextLength: totalLength,
+    });
 
     const response = await coreBrain.stream({
       messages: selected,
@@ -343,6 +429,15 @@ export async function POST(
     });
 
     /* STEP 10 — LIVE RESPONSE */
+
+    logStage("STREAM_INITIALIZED");
+
+    console.info("[BLAZE-X] AI PROVIDER READY", {
+      requestId,
+      provider: response.provider,
+      model: response.model,
+      elapsedMs: Date.now() - startedAt,
+    });
 
     return new Response(response.stream, {
       status: 200,
@@ -363,12 +458,38 @@ export async function POST(
         "X-AI-Model":
           response.model,
 
+        "X-Request-ID":
+          requestId,
+
         "X-RateLimit-Remaining":
           String(rateLimit.remaining),
       },
     });
 
-  } catch {
+  } catch (error) {
+
+    /* SAFE BACKEND ERROR DIAGNOSTICS */
+
+    console.error("[BLAZE-X] CHAT ERROR", {
+      requestId,
+
+      stage,
+
+      elapsedMs: Date.now() - startedAt,
+
+      errorType:
+        error instanceof Error
+          ? error.name
+          : "UNKNOWN_ERROR",
+
+      errorCode:
+        error instanceof AIProviderError
+          ? error.code
+          : "INTERNAL_ERROR",
+    });
+
+    /* REQUEST CANCELLED */
+
     if (request.signal.aborted) {
       return errorResponse(
         "Request cancelled.",
@@ -376,13 +497,80 @@ export async function POST(
       );
     }
 
-    console.warn(
-      "[BLAZE-X] Chat request failed."
-    );
+    /* PROVIDER ERROR */
+
+    if (error instanceof AIProviderError) {
+
+      if (error.code === "TIMEOUT") {
+        return errorResponse(
+          "AI providers are taking too long to respond. Please try again.",
+          504
+        );
+      }
+
+      if (error.code === "RATE_LIMIT") {
+        return errorResponse(
+          "AI provider usage limit reached. Please try again later.",
+          429
+        );
+      }
+
+      if (error.code === "MODEL_UNAVAILABLE") {
+        return errorResponse(
+          "The selected AI model is currently unavailable.",
+          503
+        );
+      }
+
+      if (error.code === "UNAUTHORIZED") {
+        return errorResponse(
+          "AI provider authentication failed.",
+          503
+        );
+      }
+
+      if (error.code === "NOT_CONFIGURED") {
+        return errorResponse(
+          "AI provider is not configured.",
+          503
+        );
+      }
+    }
+
+    /* STAGE-SPECIFIC ERROR */
+
+    if (stage === "AUTHENTICATION") {
+      return errorResponse(
+        "Authentication service is temporarily unavailable.",
+        503
+      );
+    }
+
+    if (stage === "REDIS_RATE_LIMIT") {
+      return errorResponse(
+        "AI usage protection is temporarily unavailable.",
+        503
+      );
+    }
+
+    if (stage === "CORE_BRAIN") {
+      return errorResponse(
+        "Core Brain could not initialize an AI response.",
+        503,
+        {
+          "X-Request-ID": requestId,
+        }
+      );
+    }
+
+    /* GENERAL BACKEND ERROR */
 
     return errorResponse(
       "BLAZE-X AI is temporarily unavailable. Please try again.",
-      503
+      503,
+      {
+        "X-Request-ID": requestId,
+      }
     );
   }
 }
@@ -399,4 +587,4 @@ export async function GET() {
   );
 }
 
-/* END OF SECURE CHAT API */
+/* END OF SECURE CHAT API V1.0.2 */
