@@ -516,7 +516,15 @@ function Workspace() {
           body: JSON.stringify({ messages: [...previousMessages, userMessage].filter(m => m.content).slice(-40).map(m => ({ role: m.role, content: m.content.slice(0, 24000) })), mode }),
           signal: controller.signal,
         });
-        if (!response.ok) throw new Error(`AI request failed (${response.status}).`);
+       if (!response.ok) {
+  const errorData = await response.json()
+    .catch(() => null);
+
+  throw new Error(
+    errorData?.error ||
+    `AI request failed (${response.status}).`
+  );
+}
         if (!response.body) throw new Error("No response stream received.");
         provider = response.headers.get("X-AI-Provider") || undefined;
         model = response.headers.get("X-AI-Model") || undefined;
