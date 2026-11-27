@@ -94,3 +94,81 @@ class OpenRouterProvider implements AIProvider {
     let closed = false, released = false, receivedText = false, receivedDone = false;
     function cleanup(cancel: boolean, reason?: unknown) {
       if (released) return;
+      released = true;
+      if (cancel) void reader.cancel(reason).catch(() => {});
+      try { reader.releaseLock(); } catch { /* already released */ }
+    }
+    function processEvent(payload: string): string {
+      if (!payload.trim()) return "";
+      if (payload.trim() === "[DONE]") { receivedDone = true; return ""; }
+      let data;
+      try { data = JSON.parse(payload); } catch { throw new AIProviderError("openrouter", "UNKNOWN", "Invalid OpenRouter streaming data.", undefined, true); }
+      if (data.error) throw new AIProviderError("openrouter", "UNKNOWN", "OpenRouter streaming request failed.", undefined, true);
+      const choice = data.choices?.[0];
+      if (choice?.finish_reason) finishReason = choice.finish_reason;
+      if (finishReason === "error") throw new AIProviderError("openrouter", "UNKNOWN", "OpenRouter generation failed.", undefined, true);
+      return typeof choice?.delta?.content === "string" ? choice.delta.content : "";
+    }
+    function processLine(line: string): string {
+      line = line.replace(/\r$/, "");
+      if (!line) { const payload = event; event = ""; return processEvent(payload); }
+      if (line.startsWith("data:")) {
+        event += (event ? "\n" : "") + line.slice(5).replace(/^ /, "");
+        if (event.length > MAX_BUFFER) throw new AIProviderError("openrouter", "UNKNOWN", "OpenRouter event exceeded buffer limit.", undefined, true);
+      }
+      return "";
+    }
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (closed) return;
+        try {
+          // Continue through comments, reasoning, metadata and partial SSE events.
+          while (!closed) {
+            const { done, value } = await reader.read();
+            if (closed) return;
+            buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+            if (buffer.length > MAX_BUFFER) throw new AIProviderError("openrouter", "UNKNOWN", "OpenRouter stream buffer exceeded limit.", undefined, true);
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            let text = "";
+            for (const line of lines) {
+              text += processLine(line);
+              if (receivedDone) break;
+            }
+            if (done && !receivedDone) {
+              if (buffer) text += processLine(buffer);
+              if (event) { text += processEvent(event); event = ""; }
+            }
+            if (text) {
+              if (!receivedText) console.info("[BLAZE-X] OPENROUTER FIRST TOKEN", { model, elapsedMs: Date.now() - startedAt });
+              receivedText = true;
+              controller.enqueue(encoder.encode(text));
+            }
+            if (done || receivedDone) {
+              if (!receivedText) throw new AIProviderError("openrouter", "UNKNOWN", "OpenRouter returned no text.", undefined, true);
+              if (!receivedDone) throw new AIProviderError("openrouter", "NETWORK_ERROR", "OpenRouter stream ended unexpectedly.", undefined, true);
+              if (finishReason && finishReason !== "stop") controller.enqueue(encoder.encode(finishReason === "length" ? "\n\n[Response reached its output limit.]" : "\n\n[Response ended before completion.]"));
+              closed = true;
+              controller.close();
+              cleanup(!done);
+              console.info("[BLAZE-X] OPENROUTER COMPLETE", { model, finishReason, elapsedMs: Date.now() - startedAt });
+              return;
+            }
+            if (text) return;
+          }
+        } catch (error) {
+          if (closed) return;
+          closed = true;
+          const safeError = provider.normalizeError(error, request, timeout);
+          console.warn("[BLAZE-X] OPENROUTER FAILED", { model, code: safeError.code, elapsedMs: Date.now() - startedAt });
+          try { controller.error(safeError); } finally { cleanup(true); }
+        }
+      },
+      cancel(reason) { closed = true; cleanup(true, reason); },
+    });
+    return { provider: this.id, model, stream };
+  }
+}
+
+export const openRouterProvider = new OpenRouterProvider();
+/* END OF OPENROUTER X ENGINE V1.0.2 */
