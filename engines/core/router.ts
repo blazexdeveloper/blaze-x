@@ -80,7 +80,9 @@ const MAX_MESSAGE_LENGTH = 24000;
 
 const MAX_CONTEXT_LENGTH = 60000;
 
-const ROUTER_TIMEOUT = 75000;
+const ROUTER_TIMEOUT = 65000;
+const FIRST_CHUNK_TIMEOUT = 12000;
+const GENERATE_TIMEOUT = 18000;
 
 /* COMPLEXITY DETECTION */
 
@@ -336,7 +338,9 @@ function logProviderFailure(
   error: unknown
 ) {
   const code =
-    error instanceof AIProviderError
+    error instanceof Error && error.name === "TimeoutError"
+      ? "TIMEOUT"
+      : error instanceof AIProviderError
       ? error.code
       : "UNKNOWN";
 
@@ -357,105 +361,80 @@ function logProviderFailure(
   providers mid-response.
 */
 
+// Race even operations that do not honour AbortSignal.
+function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+    if (signal.aborted) abort();
+  });
+}
+
+function attemptDeadline(parent: AbortSignal, ms: number) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException("Provider deadline exceeded", "TimeoutError"));
+  }, ms);
+  return {
+    signal: AbortSignal.any([parent, controller.signal]),
+    clear: () => clearTimeout(timer),
+    abort: () => controller.abort(),
+  };
+}
+
 async function primeStream(
   response: AIStreamResponse,
-  signal?: AbortSignal
+  signal: AbortSignal
 ): Promise<AIStreamResponse> {
   const reader = response.stream.getReader();
-
-  let firstChunk: Uint8Array | undefined;
-
-  try {
-    while (true) {
-      signal?.throwIfAborted();
-
-      const { done, value } =
-        await reader.read();
-
-      if (done) {
-        throw new Error(
-          "Provider returned an empty response."
-        );
-      }
-
-      if (value && value.length > 0) {
-        firstChunk = value;
-        break;
-      }
-    }
-  } catch (error) {
-    try {
-      await reader.cancel();
-    } catch {
-      // Reader already closed.
-    }
-
-    reader.releaseLock();
-
-    throw error;
-  }
-
   let released = false;
-
-  function releaseReader() {
+  function release() {
     if (!released) {
       released = true;
       reader.releaseLock();
     }
   }
-
+  function cleanup(reason?: unknown) {
+    if (released) return;
+    try {
+      void reader.cancel(reason).catch(() => {});
+    } finally {
+      release();
+    }
+  }
+  let first: Uint8Array;
+  try {
+    while (true) {
+      signal.throwIfAborted();
+      const { done, value } = await abortable(reader.read(), signal);
+      if (done) throw new Error("Provider returned an empty response.");
+      if (value?.length) { first = value; break; }
+    }
+  } catch (error) {
+    cleanup(error);
+    throw error;
+  }
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      if (firstChunk) {
-        controller.enqueue(firstChunk);
-      }
-    },
-
+    start(controller) { controller.enqueue(first); },
     async pull(controller) {
       try {
-        signal?.throwIfAborted();
-
-        const { done, value } =
-          await reader.read();
-
-        if (done) {
-          controller.close();
-
-          releaseReader();
-
-          return;
-        }
-
-        if (value) {
-          controller.enqueue(value);
-        }
+        signal.throwIfAborted();
+        const { done, value } = await abortable(reader.read(), signal);
+        if (done) { release(); controller.close(); return; }
+        if (value?.length) controller.enqueue(value);
       } catch (error) {
-        controller.error(error);
-
-        try {
-          await reader.cancel();
-        } catch {
-          // Reader already closed.
+        if (!released) {
+          cleanup(error);
+          controller.error(error);
         }
-
-        releaseReader();
       }
     },
-
-    async cancel(reason) {
-      try {
-        await reader.cancel(reason);
-      } finally {
-        releaseReader();
-      }
-    },
+    cancel(reason) { cleanup(reason); },
   });
-
-  return {
-    provider: response.provider,
-    model: response.model,
-    stream,
-  };
+  return { ...response, stream };
 }
 
 /* CORE BRAIN CLASS */
@@ -463,7 +442,7 @@ async function primeStream(
 class CoreBrain {
   readonly name = "BLAZE-X CORE BRAIN";
 
-  readonly version = "1.0.0";
+  readonly version = "1.0.1";
 
   /* STANDARD GENERATION */
 
@@ -485,10 +464,11 @@ class CoreBrain {
     for (const provider of providers) {
       prepared.signal?.throwIfAborted();
 
+      const attempt = attemptDeadline(prepared.signal!, GENERATE_TIMEOUT);
       try {
-        const response = await provider.generate(
-          prepared
-        );
+        const response = await abortable(provider.generate({
+          ...prepared, signal: attempt.signal,
+        }), attempt.signal);
 
         if (!response.content.trim()) {
           throw new Error(
@@ -503,6 +483,9 @@ class CoreBrain {
         }
 
         logProviderFailure(provider, error);
+      } finally {
+        attempt.clear();
+        attempt.abort();
       }
     }
 
@@ -531,20 +514,21 @@ class CoreBrain {
     for (const provider of providers) {
       prepared.signal?.throwIfAborted();
 
+      const attempt = attemptDeadline(prepared.signal!, FIRST_CHUNK_TIMEOUT);
       try {
-        const response = await provider.stream(
-          prepared
-        );
-
-        return await primeStream(
-          response,
-          prepared.signal
-        );
+        const pending = provider.stream({ ...prepared, signal: attempt.signal });
+        // Dispose a response that arrives after its attempt has expired.
+        void pending.then(response => {
+          if (attempt.signal.aborted) void response.stream.cancel().catch(() => {});
+        }, () => {});
+        const response = await abortable(pending, attempt.signal);
+        const primed = await primeStream(response, attempt.signal);
+        attempt.clear(); // First text arrived; overall deadline still applies.
+        return primed;
       } catch (error) {
-        if (prepared.signal?.aborted) {
-          throw error;
-        }
-
+        attempt.clear();
+        attempt.abort();
+        if (prepared.signal?.aborted) throw error;
         logProviderFailure(provider, error);
       }
     }
